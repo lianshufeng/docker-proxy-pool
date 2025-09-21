@@ -19,7 +19,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push CPU tasker
+      - name: Build and push
         working-directory: ./
         run: |
           IMAGE_NAME=lianshufeng/proxy-pool:latest
