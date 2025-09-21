@@ -1,7 +1,7 @@
-// placeholder fetcher.go
 package fetcher
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,68 +9,105 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"go.uber.org/zap"
-
-	"github.com/lianshufeng/proxy-pool/internal/config"
-	"github.com/lianshufeng/proxy-pool/internal/pool"
 )
 
-func Start(ctx context.Context, log *zap.Logger, cfg config.Config, p *pool.Pool) {
-	// 立即拉一次
-	go func() {
-		if list, err := fetch(cfg.APIURL); err != nil {
-			log.Warn("initial fetch failed", zap.Error(err))
-		} else {
-			p.Set(list, cfg.TTL)
-		}
-		p.Clean()
-	}()
+type Fetcher struct {
+	apiURL string
+	client *http.Client
 
-	ticker := time.NewTicker(cfg.FetchInterval)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				list, err := fetch(cfg.APIURL)
-				if err != nil {
-					log.Warn("fetch failed", zap.Error(err))
-				} else if len(list) > 0 {
-					p.Set(list, cfg.TTL)
-					log.Info("proxies refreshed", zap.Int("count", len(list)))
-				}
-				p.Clean()
-			}
-		}
-	}()
+	cache  []string
+	cursor int
 }
 
-func fetch(api string) ([]string, error) {
-	cli := &http.Client{Timeout: 10 * time.Second}
-	resp, err := cli.Get(api)
+func New(apiURL string, dialTimeout time.Duration) *Fetcher {
+	return &Fetcher{
+		apiURL: apiURL,
+		client: &http.Client{Timeout: dialTimeout},
+	}
+}
+
+// FetchList 拉取一次 API，支持 JSON 数组或换行文本
+func (f *Fetcher) FetchList(ctx context.Context) ([]string, error) {
+	if f.apiURL == "" {
+		return nil, errors.New("empty api url")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 
-	// JSON 数组
-	var arr []string
-	if json.Unmarshal(body, &arr) == nil {
-		return arr, nil
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, errors.New("bad status: " + resp.Status + " body: " + string(b))
 	}
-	// 换行文本
-	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
-	out := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if s := strings.TrimSpace(ln); s != "" {
-			out = append(out, s)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// 优先解析 JSON
+	var arr []string
+	if err := json.Unmarshal(body, &arr); err == nil && len(arr) > 0 {
+		return normalize(arr), nil
+	}
+
+	// 退化为按行文本
+	return readLines(string(body)), nil
+}
+
+func readLines(s string) []string {
+	var res []string
+	sc := bufio.NewScanner(strings.NewReader(s))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" {
+			res = append(res, line)
 		}
 	}
-	if len(out) == 0 {
-		return nil, errors.New("no proxies parsed")
+	return normalize(res)
+}
+
+func normalize(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		// 不再强行补 "http://"
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
 	}
-	return out, nil
+	return out
+}
+
+// Next 每次返回一个地址；缓存耗尽则自动重新拉取
+func (f *Fetcher) Next(ctx context.Context) (string, error) {
+	if f.cursor < len(f.cache) {
+		addr := f.cache[f.cursor]
+		f.cursor++
+		return addr, nil
+	}
+	list, err := f.FetchList(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(list) == 0 {
+		return "", errors.New("empty proxy list from api")
+	}
+	f.cache = list
+	f.cursor = 0
+	addr := f.cache[f.cursor]
+	f.cursor++
+	return addr, nil
 }

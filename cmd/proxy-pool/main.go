@@ -1,9 +1,8 @@
-// placeholder main.go - see conversation for full code
 package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,55 +10,93 @@ import (
 
 	"github.com/lianshufeng/proxy-pool/internal/config"
 	"github.com/lianshufeng/proxy-pool/internal/fetcher"
-	"github.com/lianshufeng/proxy-pool/internal/log"
-	"github.com/lianshufeng/proxy-pool/internal/metrics"
 	"github.com/lianshufeng/proxy-pool/internal/pool"
 	"github.com/lianshufeng/proxy-pool/internal/server"
 )
 
-var (
-	version = "dev" // 由 ldflags 注入
-	commit  = "none"
-	date    = "unknown"
-)
-
 func main() {
-	cfg := config.Parse()
-	logger := log.New(cfg.Env)
-	defer logger.Sync()
+	// —— 强制把日志打到标准输出，并带微秒+文件行号 —— //
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
-	logger.Infow("starting",
-		"version", version, "commit", commit, "date", date,
-		"listen", cfg.ListenAddr, "api", cfg.APIURL,
-		"interval", cfg.FetchInterval.String(), "ttl", cfg.TTL.String(),
-	)
+	log.Println("[BOOT] ===== proxy-pool starting (this banner proves you are running the new binary) =====")
+
+	cfg := config.Parse()
+	if cfg.APIURL == "" {
+		log.Fatal("missing --api-url")
+	}
+
+	pl := pool.New()
+	ft := fetcher.New(cfg.APIURL, cfg.DialTimeout)
+
+	srv := server.New(server.Options{
+		Listen:              cfg.Listen,
+		Pool:                pl,
+		DialTimeout:         cfg.DialTimeout,
+		IdleConns:           cfg.IdleConn,
+		IdleTimeout:         cfg.IdleTimeout,
+		TLSHandshakeTimeout: cfg.HandshakeTimeout,
+	})
+
+	log.Printf("[BOOT] listen=%s api-url=%s append-interval=%s ttl=%s", cfg.Listen, cfg.APIURL, cfg.AppendInterval, cfg.TTL)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 代理池 & 拉取任务
-	pp := pool.New()
-	fetcher.Start(ctx, logger.Desugar(), cfg, pp)
+	// 每隔 append-interval 追加 1 个代理
+	go func() {
+		iv := cfg.AppendInterval
+		if iv <= 0 {
+			iv = 10 * time.Second
+		}
+		tk := time.NewTicker(iv)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				addr, err := ft.Next(ctx)
+				if err != nil {
+					log.Printf("[APPEND] fetch next failed: %v", err)
+					continue
+				}
+				pl.Add(addr, cfg.TTL)
+				log.Printf("[APPEND] added=%q size=%d", addr, pl.Size())
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
-	// 启动 Proxy 与 Metrics
-	proxySrv := server.Start(ctx, logger.Desugar(), cfg, pp)
-	metricSrv := metrics.Start(logger.Desugar(), cfg.MetricsListen)
+	// 定期清理过期项
+	go func() {
+		tk := time.NewTicker(30 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-tk.C:
+				before := pl.Size()
+				pl.Sweep()
+				after := pl.Size()
+				log.Printf("[SWEEP] before=%d after=%d", before, after)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// 启动代理
+	go func() {
+		log.Printf("[BOOT] starting proxy server on %s ...", cfg.Listen)
+		if err := srv.Start(); err != nil {
+			log.Printf("[EXIT] proxy server stopped: %v", err)
+		}
+	}()
 
 	// 优雅退出
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	logger.Infow("shutting down...")
-
-	shutdown := func(name string, fn func(context.Context) error, d time.Duration) {
-		c, cancel := context.WithTimeout(context.Background(), d)
-		defer cancel()
-		_ = fn(c)
-		logger.Infow(fmt.Sprintf("%s stopped", name))
-	}
-	shutdown("proxy", proxySrv.Shutdown, 5*time.Second)
-	if metricSrv != nil {
-		shutdown("metrics", metricSrv.Shutdown, 3*time.Second)
-	}
-	logger.Infow("bye")
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Printf("[EXIT] shutting down...")
+	cancel()
+	_ = srv.Shutdown()
 }
