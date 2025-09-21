@@ -2,9 +2,6 @@ services:
 
   proxy-pool:
     image: lianshufeng/proxy-pool:latest
-    volumes:
-      - ./conf/celery_config.py:/opt/tasker/conf/celery_config.py
-      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "6808:6808"
     command: --api-url="http://api-url"
